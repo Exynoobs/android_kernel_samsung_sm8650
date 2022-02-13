@@ -548,6 +548,7 @@ struct wacom_data {
 	volatile bool ble_block_flag;
 	bool ble_charging_state;
 	bool ble_disable_flag;
+	bool charging;
 
 	/* for tui or factory test */
 	bool epen_blocked;
@@ -720,6 +721,7 @@ int wacom_check_ub(struct wacom_data *wacom);
 void wacom_swap_compensation(struct wacom_data *wacom, char cmd);
 
 int wacom_ble_charge_mode(struct wacom_data *wacom, int mode);
+int start_epen_ble_charging(struct wacom_data *wacom);
 
 //core
 int wacom_init(struct wacom_data *wacom);

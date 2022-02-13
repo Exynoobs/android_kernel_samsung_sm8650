@@ -1505,9 +1505,11 @@ static irqreturn_t wacom_interrupt_pdct(int irq, void *dev_id)
 	}
 
 	wacom->pen_pdct = gpio_get_value(wacom->pdct_gpio);
-	if (wacom->pen_pdct)
+	if (wacom->pen_pdct) {
 		wacom->function_result &= ~EPEN_EVENT_PEN_OUT;
-	else
+		if (wacom->charging)
+			start_epen_ble_charging(wacom);
+	} else
 		wacom->function_result |= EPEN_EVENT_PEN_OUT;
 
 	input_info(true, wacom->dev, "%s: pen is %s (%d)\n",
