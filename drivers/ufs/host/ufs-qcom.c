@@ -43,6 +43,10 @@
 #include <ufs/ufs_quirks.h>
 #include <ufs/ufshcd-crypto-qti.h>
 
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+#include "ufs-sec-feature.h"
+#endif
+
 #define MCQ_QCFGPTR_MASK	GENMASK(7, 0)
 #define MCQ_QCFGPTR_UNIT	0x200
 #define MCQ_SQATTR_OFFSET(c) \
@@ -64,7 +68,7 @@
 #define	UFS_QCOM_IRQ_SLVR_MASK	0x0f
 #define	UFS_QCOM_ESI_AFFINITY_MASK	0xf0
 
-#define UFS_QCOM_BER_TH_DEF_G1_G4	0
+#define UFS_QCOM_BER_TH_DEF_G1_G4	3
 #define UFS_QCOM_BER_TH_DEF_G5	3
 /*
  * Default time window of PHY BER monitor in millisecond.
@@ -781,6 +785,11 @@ static int ufs_qcom_host_reset(struct ufs_hba *hba)
 	bool reenable_intr = false;
 
 	host->reset_in_progress = true;
+
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+	/* check device_stuck info and call panic before host reset */
+	ufs_sec_check_device_stuck();
+#endif
 
 	if (!host->core_reset) {
 		dev_warn(hba->dev, "%s: reset control not set\n", __func__);
@@ -1815,6 +1824,11 @@ static int ufs_qcom_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op,
 	ufs_qcom_ice_disable(host);
 
 	cancel_dwork_unvote_cpufreq(hba);
+
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+	if (pm_op == UFS_SYSTEM_PM)
+		ufs_sec_print_err();
+#endif
 	return err;
 }
 
@@ -2395,6 +2409,8 @@ struct ufs_qcom_dev_params ufs_qcom_cap;
 		/* update BER threshold depends on gear mode */
 		if (!override_ber_threshold && !ret)
 			ber_threshold = ber_table[dev_req_params->gear_rx].ber_threshold;
+
+		host->skip_flush = false;
 		break;
 	default:
 		ret = -EINVAL;
@@ -2542,8 +2558,8 @@ static int ufs_qcom_apply_dev_quirks(struct ufs_hba *hba)
 	spin_lock_irqsave(hba->host->host_lock, flags);
 	/* Set the rpm auto suspend delay to 3s */
 	hba->host->hostt->rpm_autosuspend_delay = UFS_QCOM_AUTO_SUSPEND_DELAY;
-	/* Set the default auto-hiberate idle timer value to 5ms */
-	hba->ahit = FIELD_PREP(UFSHCI_AHIBERN8_TIMER_MASK, 5) |
+	/* Set the default auto-hiberate idle timer value to 2ms */
+	hba->ahit = FIELD_PREP(UFSHCI_AHIBERN8_TIMER_MASK, 2) |
 		    FIELD_PREP(UFSHCI_AHIBERN8_SCALE_MASK, 3);
 	/* Set the clock gating delay to performance mode */
 	hba->clk_gating.delay_ms = UFS_QCOM_CLK_GATING_DELAY_MS_PERF;
@@ -2565,6 +2581,16 @@ static int ufs_qcom_apply_dev_quirks(struct ufs_hba *hba)
 
 	if (hba->dev_info.wmanufacturerid == UFS_VENDOR_MICRON)
 		hba->dev_quirks |= UFS_DEVICE_QUIRK_DELAY_BEFORE_LPM;
+
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+	/* check only at the first init */
+	if (!(hba->eh_flags || hba->pm_op_in_progress)) {
+		/* sec special features */
+		ufs_sec_set_features(hba);
+	}
+
+	ufs_sec_config_features(hba);
+#endif
 
 	return err;
 }
@@ -2613,6 +2639,12 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 				| UFSHCD_QUIRK_BROKEN_PA_RXHSUNTERMCAP);
 	}
 
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+	/* no use broken_ahit_wa */
+	host->broken_ahit_wa = false;
+	hba->quirks |= UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
+#endif
+
 	if (host->disable_lpm || host->broken_ahit_wa)
 		hba->quirks |= UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
 
@@ -2628,7 +2660,6 @@ static void ufs_qcom_set_caps(struct ufs_hba *hba)
 	if (!host->disable_lpm) {
 		hba->caps |= UFSHCD_CAP_CLK_GATING |
 			UFSHCD_CAP_HIBERN8_WITH_CLK_GATING |
-			UFSHCD_CAP_CLK_SCALING |
 			UFSHCD_CAP_AUTO_BKOPS_SUSPEND |
 			UFSHCD_CAP_AGGR_POWER_COLLAPSE |
 			UFSHCD_CAP_WB_WITH_CLK_SCALING;
@@ -3306,8 +3337,8 @@ static int ufs_qcom_set_cur_therm_state(struct thermal_cooling_device *tcd,
 
 		atomic_set(&host->therm_mitigation, 0);
 
-		/* Set the default auto-hiberate idle timer to 5 ms */
-		ufshcd_auto_hibern8_update(hba, ufs_qcom_us_to_ahit(5000));
+		/* Set the default auto-hiberate idle timer to 2 ms */
+		ufshcd_auto_hibern8_update(hba, ufs_qcom_us_to_ahit(2000));
 
 		/* Set the default auto suspend delay to 3000 ms */
 		shost_for_each_device(sdev, hba->host)
@@ -3325,8 +3356,8 @@ static int ufs_qcom_set_cur_therm_state(struct thermal_cooling_device *tcd,
 		if (host->irq_affinity_support)
 			ufs_qcom_toggle_pri_affinity(hba, false);
 
-		/* Set the default auto-hiberate idle timer to 1 ms */
-		ufshcd_auto_hibern8_update(hba, ufs_qcom_us_to_ahit(1000));
+		/* Set the default auto-hiberate idle timer to 2 ms */
+		ufshcd_auto_hibern8_update(hba, ufs_qcom_us_to_ahit(2000));
 
 		/* Set the default auto suspend delay to 100 ms */
 		shost_for_each_device(sdev, hba->host)
@@ -3914,6 +3945,9 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 	ufs_qcom_parse_broken_ahit_workaround_flag(host);
 	ufs_qcom_set_caps(hba);
 	ufs_qcom_advertise_quirks(hba);
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+	ufs_sec_adjust_caps_quirks(hba);
+#endif
 
 	err = ufs_qcom_shared_ice_init(hba);
 	if (err)
@@ -4452,6 +4486,10 @@ static void ufs_qcom_event_notify(struct ufs_hba *hba,
 	default:
 		break;
 	}
+
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+	ufs_sec_inc_op_err(hba, evt, data);
+#endif
 }
 
 void ufs_qcom_print_hw_debug_reg_all(struct ufs_hba *hba,
@@ -5017,6 +5055,17 @@ static int ufs_qcom_device_reset(struct ufs_hba *hba)
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
 	int ret = 0;
 
+	/* guarantee device internal cache flush */
+	if (hba->eh_flags && !host->skip_flush) {
+		dev_info(hba->dev, "%s: Waiting for device internal cache flush\n",
+				__func__);
+		ssleep(2);
+		host->skip_flush = true;
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+		ufs_sec_inc_hwrst_cnt();
+#endif
+	}
+
 	/* Reset UFS Host Controller and PHY */
 	ret = ufs_qcom_host_reset(hba);
 	if (ret)
@@ -5084,6 +5133,8 @@ static struct ufs_dev_quirk ufs_qcom_dev_fixups[] = {
 static void ufs_qcom_fixup_dev_quirks(struct ufs_hba *hba)
 {
 	ufshcd_fixup_dev_quirks(hba, ufs_qcom_dev_fixups);
+
+	hba->dev_quirks &= ~(UFS_DEVICE_QUIRK_RECOVERY_FROM_DL_NAC_ERRORS);
 }
 
 /* Resources */
@@ -5875,7 +5926,9 @@ static void ufs_qcom_hook_check_int_errors(void *param, struct ufs_hba *hba,
 
 static void ufs_qcom_update_sdev(void *param, struct scsi_device *sdev)
 {
+#if !IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
 	sdev->broken_fua = 1;
+#endif
 }
 
 /*
@@ -5894,6 +5947,10 @@ static void ufs_qcom_register_hooks(void)
 	register_trace_android_vh_ufs_check_int_errors(
 				ufs_qcom_hook_check_int_errors, NULL);
 	register_trace_android_vh_ufs_update_sdev(ufs_qcom_update_sdev, NULL);
+
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+	ufs_sec_register_vendor_hooks();
+#endif
 }
 
 #ifdef CONFIG_ARM_QCOM_CPUFREQ_HW
@@ -6011,6 +6068,9 @@ static int ufs_qcom_probe(struct platform_device *pdev)
 		return err;
 	}
 
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+	ufs_sec_init_logging(dev);
+#endif
 	/* Perform generic probe */
 	err = ufshcd_pltfrm_init(pdev, &ufs_hba_qcom_vops);
 	if (err)
@@ -6051,6 +6111,10 @@ static int ufs_qcom_remove(struct platform_device *pdev)
 	if (msm_minidump_enabled())
 		atomic_notifier_chain_unregister(&panic_notifier_list,
 				&host->ufs_qcom_panic_nb);
+
+#if IS_ENABLED(CONFIG_SEC_UFS_FEATURE)
+	ufs_sec_remove_features(hba);
+#endif
 
 	ufshcd_remove(hba);
 	platform_msi_domain_free_irqs(hba->dev);

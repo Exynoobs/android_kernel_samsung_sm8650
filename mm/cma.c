@@ -439,7 +439,7 @@ struct page *__cma_alloc(struct cma *cma, unsigned long count,
 	struct page *page = NULL;
 	int ret = -ENOMEM;
 	int num_attempts = 0;
-	int max_retries = 5;
+	int max_retries = 10;
 	const char *name = cma ? cma->name : NULL;
 
 	trace_cma_alloc_start(name, count, align);

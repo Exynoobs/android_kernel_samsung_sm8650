@@ -61,7 +61,7 @@ enum {
 /* NOP OUT retries waiting for NOP IN response */
 #define NOP_OUT_RETRIES    10
 /* Timeout after 50 msecs if NOP OUT hangs without response */
-#define NOP_OUT_TIMEOUT    50 /* msecs */
+#define NOP_OUT_TIMEOUT    100 /* msecs */
 
 /* Query request retries */
 #define QUERY_REQ_RETRIES 3
@@ -72,7 +72,7 @@ enum {
 #define ADVANCED_RPMB_REQ_TIMEOUT  3000 /* 3 seconds */
 
 /* Task management command timeout */
-#define TM_CMD_TIMEOUT	100 /* msecs */
+#define TM_CMD_TIMEOUT	300 /* msecs */
 
 /* maximum number of retries for a general UIC command  */
 #define UFS_UIC_COMMAND_RETRIES 3
@@ -1341,6 +1341,10 @@ static int ufshcd_scale_gear(struct ufs_hba *hba, bool scale_up)
 static int ufshcd_clock_scaling_prepare(struct ufs_hba *hba, u64 timeout_us)
 {
 	int ret = 0;
+
+	/* let's not get into low power until clock scaling is completed */
+	ufshcd_hold(hba, false);
+
 	/*
 	 * make sure that there are no outstanding requests when
 	 * clock scaling is in progress
@@ -1355,11 +1359,9 @@ static int ufshcd_clock_scaling_prepare(struct ufs_hba *hba, u64 timeout_us)
 		up_write(&hba->clk_scaling_lock);
 		mutex_unlock(&hba->wb_mutex);
 		ufshcd_scsi_unblock_requests(hba);
+		ufshcd_release(hba);
 		goto out;
 	}
-
-	/* let's not get into low power until clock scaling is completed */
-	ufshcd_hold(hba, false);
 
 out:
 	return ret;
@@ -1765,6 +1767,8 @@ static void ufshcd_exit_clk_scaling(struct ufs_hba *hba)
 	hba->clk_scaling.is_initialized = false;
 }
 
+static bool ufshcd_clk_gating_in_progress;
+
 static void ufshcd_ungate_work(struct work_struct *work)
 {
 	int ret;
@@ -1802,6 +1806,9 @@ static void ufshcd_ungate_work(struct work_struct *work)
 	}
 unblock_reqs:
 	ufshcd_scsi_unblock_requests(hba);
+	spin_lock_irqsave(hba->host->host_lock, flags);
+	ufshcd_clk_gating_in_progress = false;
+	spin_unlock_irqrestore(hba->host->host_lock, flags);
 }
 
 /**
@@ -1833,8 +1840,7 @@ start:
 		 * Make sure we exit hibern8 state also in addition to
 		 * clocks being ON.
 		 */
-		if (ufshcd_can_hibern8_during_gating(hba) &&
-		    ufshcd_is_link_hibern8(hba)) {
+		if (ufshcd_clk_gating_in_progress) {
 			if (async) {
 				rc = -EAGAIN;
 				hba->clk_gating.active_reqs--;
@@ -1866,8 +1872,10 @@ start:
 		trace_ufshcd_clk_gating(dev_name(hba->dev),
 					hba->clk_gating.state);
 		if (queue_work(hba->clk_gating.clk_gating_workq,
-			       &hba->clk_gating.ungate_work))
+			       &hba->clk_gating.ungate_work)) {
+			ufshcd_clk_gating_in_progress = true;
 			ufshcd_scsi_block_requests(hba);
+		}
 		/*
 		 * fall through to check if we should wait for this
 		 * work to be done or not.
@@ -2465,6 +2473,10 @@ ufshcd_wait_for_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
 		dev_err(hba->dev,
 			"uic cmd 0x%x with arg3 0x%x completion timeout\n",
 			uic_cmd->command, uic_cmd->argument3);
+
+		ufshcd_print_host_state(hba);
+		ufshcd_print_pwr_info(hba);
+		ufshcd_print_evt_hist(hba);
 
 		if (!uic_cmd->cmd_active) {
 			dev_err(hba->dev, "%s: UIC cmd has been completed, return the result\n",
@@ -4301,6 +4313,7 @@ check_upmcrs:
 	}
 out:
 	if (ret) {
+		trace_android_vh_ufs_send_uic_command(hba, hba->active_uic_cmd, UFS_CMD_ERR);
 		ufshcd_print_host_state(hba);
 		ufshcd_print_pwr_info(hba);
 		ufshcd_print_evt_hist(hba);
@@ -4695,7 +4708,7 @@ static int ufshcd_complete_dev_init(struct ufs_hba *hba)
 					QUERY_FLAG_IDN_FDEVICEINIT, 0, &flag_res);
 		if (!flag_res)
 			break;
-		usleep_range(500, 1000);
+		usleep_range(5000, 10000);
 	} while (ktime_before(ktime_get(), timeout));
 
 	if (err) {
@@ -5399,9 +5412,11 @@ ufshcd_transfer_rsp_status(struct ufs_hba *hba, struct ufshcd_lrb *lrbp,
 			 */
 			if (!hba->pm_op_in_progress &&
 			    !ufshcd_eh_in_progress(hba) &&
-			    ufshcd_is_exception_event(lrbp->ucd_rsp_ptr))
+			    ufshcd_is_exception_event(lrbp->ucd_rsp_ptr)) {
 				/* Flushed in suspend */
 				schedule_work(&hba->eeh_work);
+				dev_info(hba->dev, "exception event reported\n");
+			}
 
 			if (scsi_status == SAM_STAT_GOOD)
 				ufshpb_rsp_upiu(hba, lrbp);
@@ -5991,9 +6006,14 @@ static void ufshcd_bkops_exception_event_handler(struct ufs_hba *hba)
 	if (curr_status < BKOPS_STATUS_PERF_IMPACT) {
 		dev_err(hba->dev, "%s: device raised urgent BKOPS exception for bkops status %d\n",
 				__func__, curr_status);
-		/* update the current status as the urgent bkops level */
-		hba->urgent_bkops_lvl = curr_status;
-		hba->is_urgent_bkops_lvl_checked = true;
+		/*
+		 * SEC does not follow this policy that BKOPS is enabled for these events
+		 * update the current status as the urgent bkops level
+		 */
+		//hba->urgent_bkops_lvl = curr_status;
+		//hba->is_urgent_bkops_lvl_checked = true;
+
+		goto out;
 	}
 
 enable_auto_bkops:
@@ -9402,7 +9422,7 @@ static int ufshcd_execute_start_stop(struct scsi_device *sdev,
 	};
 
 	return scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_IN, /*buffer=*/NULL,
-			/*bufflen=*/0, /*timeout=*/HZ, /*retries=*/0, &args);
+			/*bufflen=*/0, /*timeout=*/10 * HZ, /*retries=*/0, &args);
 }
 
 /**
@@ -9562,6 +9582,11 @@ static void ufshcd_vreg_set_lpm(struct ufs_hba *hba)
 	 */
 	if (ufshcd_is_ufs_dev_poweroff(hba) && ufshcd_is_link_off(hba) &&
 	    !hba->dev_info.is_lu_power_on_wp) {
+		if (hba->dev_info.wmanufacturerid == UFS_VENDOR_MICRON) {
+			pr_err("add 20ms delay before VCCQ off for Micron.\n");
+			mdelay(20);
+		}
+
 		ufshcd_setup_vreg(hba, false);
 		vcc_off = true;
 	} else if (!ufshcd_is_ufs_dev_active(hba)) {

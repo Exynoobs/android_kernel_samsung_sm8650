@@ -1407,6 +1407,94 @@ static int master_cdsp_stats_show(struct seq_file *s, void *d)
 
 DEFINE_SHOW_ATTRIBUTE(master_cdsp_stats);
 
+void show_cdsp_clock(char *buf, int len) {
+	if (!g_sysmon_stats.smem_init_cdsp)
+		sysmon_smem_init_cdsp();
+
+	if (g_sysmon_stats.sysmon_event_stats_cdsp) {
+		scnprintf(buf, len, "%d", g_sysmon_stats.sysmon_event_stats_cdsp->QDSP6_clk);
+	}
+}
+EXPORT_SYMBOL_GPL(show_cdsp_clock);
+
+char *strcat(char *dest, const char *src)
+{
+	char *tmp = dest;
+
+	while (*dest)
+		dest++;
+	while ((*dest++ = *src++) != '\0')
+		;
+	return tmp;
+}
+
+void show_cdsp_table(char *buf) {
+	struct sysmon_smem_power_stats sysmon_power_stats = { 0 };
+	char tmp[10] = {0, };
+	int j = 0;
+
+	if (!g_sysmon_stats.smem_init_cdsp)
+		sysmon_smem_init_cdsp();
+
+	if (g_sysmon_stats.sysmon_power_stats_cdsp) {
+		if (copy_powerstats(&sysmon_power_stats, CDSP))
+			return;
+
+		for (j = SYSMON_POWER_STATS_MAX_CLK_LEVELS - 1; j >= 0; j--) {
+			if (sysmon_power_stats.clk_arr[j]) {
+				memset(&tmp, 0x0, sizeof(tmp));
+				scnprintf(tmp, sizeof(tmp), "%u\n", sysmon_power_stats.clk_arr[j]);
+				strcat(buf, tmp);
+			}
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(show_cdsp_table);
+
+void show_time_in_state(char *buf) {
+	struct sysmon_smem_power_stats_extended *ptr = NULL;
+	struct sysmon_smem_power_stats sysmon_power_stats = { 0 };
+	u64 lpm_accumulated = 0;
+	int ret = 0;
+	int ver = 0;
+	char tmp[100] = {0, };
+	int j = 0;
+
+	if (!g_sysmon_stats.smem_init_cdsp)
+		sysmon_smem_init_cdsp();
+
+	if (g_sysmon_stats.sleep_stats_cdsp) {
+		lpm_accumulated = g_sysmon_stats.sleep_stats_cdsp->accumulated;
+
+		if (g_sysmon_stats.sleep_stats_cdsp->last_entered_at >
+					g_sysmon_stats.sleep_stats_cdsp->last_exited_at)
+			lpm_accumulated += arch_timer_read_counter() -
+						g_sysmon_stats.sleep_stats_cdsp->last_entered_at;
+	}
+
+	if (g_sysmon_stats.sysmon_power_stats_cdsp) {
+		if (copy_powerstats(&sysmon_power_stats, CDSP))
+			return;
+		ptr = g_sysmon_stats.sysmon_power_stats_cdsp;
+		ver = (ptr->powerstats.version) & 0xFF;
+		ret = add_delta_time(ver, 0, lpm_accumulated, &sysmon_power_stats, CDSP);
+
+		if (ret)
+			pr_err("\nWarning: Power Stats might be Invalid\n");
+
+		for (j = 0; j < SYSMON_POWER_STATS_MAX_CLK_LEVELS; j++) {
+			if (sysmon_power_stats.clk_arr[j]) {
+				memset(&tmp, 0x0, sizeof(tmp));
+				scnprintf(tmp, sizeof(tmp), "%u %u\n",
+					sysmon_power_stats.clk_arr[j],
+					sysmon_power_stats.active_time[j] * 1000);
+				strcat(buf, tmp);
+			}
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(show_time_in_state);
+
 static int  __init sysmon_stats_init(void)
 {
 

@@ -24,7 +24,7 @@
 
 #include "qrtr.h"
 
-#define QRTR_LOG_PAGE_CNT 4
+#define QRTR_LOG_PAGE_CNT 16
 #define QRTR_INFO(ctx, x, ...)				\
 	ipc_log_string(ctx, x, ##__VA_ARGS__)
 
@@ -146,11 +146,14 @@ u32 qrtr_ports_next = QRTR_MIN_EPH_SOCKET;
 static DEFINE_SPINLOCK(qrtr_port_lock);
 
 /* backup buffers */
-#define QRTR_BACKUP_HI_NUM	5
+#define QRTR_BACKUP_HI_NUM	10
 #define QRTR_BACKUP_HI_SIZE	SZ_16K
+#define QRTR_BACKUP_MD_NUM	20
+#define QRTR_BACKUP_MD_SIZE	SZ_1K
 #define QRTR_BACKUP_LO_NUM	20
-#define QRTR_BACKUP_LO_SIZE	SZ_1K
+#define QRTR_BACKUP_LO_SIZE	SZ_256
 static struct sk_buff_head qrtr_backup_lo;
+static struct sk_buff_head qrtr_backup_md;
 static struct sk_buff_head qrtr_backup_hi;
 static struct work_struct qrtr_backup_work;
 
@@ -462,7 +465,7 @@ static void __qrtr_node_release(struct kref *kref)
 		kfree(flow);
 	}
 	mutex_unlock(&node->qrtr_tx_lock);
-
+	QRTR_INFO(node->ilc, "RELEASE node %px\n", node);
 	kfree(node);
 }
 
@@ -824,8 +827,11 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 		rc = -ENODEV;
 		if (node->ep)
 			rc = node->ep->xmit(node->ep, skb);
-		else
+		else {
+			if (node->ilc)
+				QRTR_INFO(node->ilc, "node->ep NULL confirm_rx : %d\n", confirm_rx);
 			kfree_skb(skb);
+		}
 		mutex_unlock(&node->ep_lock);
 	}
 	/* Need to ensure that a subsequent message carries the otherwise lost
@@ -936,6 +942,16 @@ static void qrtr_alloc_backup(struct work_struct *work)
 			break;
 		skb_queue_tail(&qrtr_backup_lo, skb);
 	}
+
+	while (skb_queue_len(&qrtr_backup_md) < QRTR_BACKUP_MD_NUM) {
+                skb = alloc_skb_with_frags(sizeof(struct qrtr_hdr_v1),
+                                           QRTR_BACKUP_MD_SIZE, 0, &errcode,
+                                           GFP_KERNEL);
+                if (!skb)
+                        break;
+                skb_queue_tail(&qrtr_backup_md, skb);
+        }
+
 	while (skb_queue_len(&qrtr_backup_hi) < QRTR_BACKUP_HI_NUM) {
 		skb = alloc_skb_with_frags(sizeof(struct qrtr_hdr_v1),
 					   QRTR_BACKUP_HI_SIZE, 0, &errcode,
@@ -952,6 +968,8 @@ static struct sk_buff *qrtr_get_backup(size_t len)
 
 	if (len < QRTR_BACKUP_LO_SIZE)
 		skb = skb_dequeue(&qrtr_backup_lo);
+        else if (len < QRTR_BACKUP_MD_SIZE)
+                skb = skb_dequeue(&qrtr_backup_md);
 	else if (len < QRTR_BACKUP_HI_SIZE)
 		skb = skb_dequeue(&qrtr_backup_hi);
 
@@ -964,6 +982,7 @@ static struct sk_buff *qrtr_get_backup(size_t len)
 static void qrtr_backup_init(void)
 {
 	skb_queue_head_init(&qrtr_backup_lo);
+	skb_queue_head_init(&qrtr_backup_md);
 	skb_queue_head_init(&qrtr_backup_hi);
 	INIT_WORK(&qrtr_backup_work, qrtr_alloc_backup);
 	queue_work(system_unbound_wq, &qrtr_backup_work);
@@ -973,6 +992,7 @@ static void qrtr_backup_deinit(void)
 {
 	cancel_work_sync(&qrtr_backup_work);
 	skb_queue_purge(&qrtr_backup_lo);
+	skb_queue_purge(&qrtr_backup_md);
 	skb_queue_purge(&qrtr_backup_hi);
 }
 
@@ -1096,13 +1116,23 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 		kthread_queue_work(&node->kworker, &node->read_data);
 		pm_wakeup_ws_event(node->ws, qrtr_wakeup_ms, true);
 	} else {
+		int ret = 0;
+		int debug = (cb->src_node == 0)||(cb->src_node == 5);
+		u8 confirm_rx = cb->confirm_rx;
+
 		ipc = qrtr_port_lookup(cb->dst_port);
 		if (!ipc) {
 			kfree_skb(skb);
 			return -ENODEV;
 		}
 
-		if (sock_queue_rcv_skb(&ipc->sk, skb)) {
+		ret = sock_queue_rcv_skb(&ipc->sk, skb);
+		if (debug)
+			QRTR_INFO(node->ilc, "POST [0x%x:0x%x] cf=%d 0x%px (%d) %d (%px) %d\n", ipc->us.sq_node, ipc->us.sq_port, confirm_rx,
+				skb, ipc->sk.sk_receive_queue.qlen,
+				skwq_has_sleeper(ipc->sk.sk_wq), ipc->sk.sk_wq?ipc->sk.sk_wq->wait.head.next:NULL,
+				ret);
+		if (ret) {
 			qrtr_port_put(ipc);
 			goto err;
 		}
@@ -2041,7 +2071,6 @@ static int qrtr_recvmsg(struct socket *sock, struct msghdr *msg,
 	struct qrtr_cb *cb;
 	int copied, rc;
 
-
 	if (sock_flag(sk, SOCK_ZAPPED))
 		return -EADDRNOTAVAIL;
 
@@ -2051,7 +2080,14 @@ static int qrtr_recvmsg(struct socket *sock, struct msghdr *msg,
 
 	lock_sock(sk);
 	cb = (struct qrtr_cb *)skb->cb;
-
+	if ((cb->src_node == 0) || (cb->src_node == 5)) {
+		struct qrtr_node *node;
+		node = qrtr_node_lookup(cb->src_node);
+		if (node) {
+			QRTR_INFO(node->ilc, "RECV [0x%x:0x%x(cf=%d)] %px %px\n", cb->dst_node, cb->dst_port, cb->confirm_rx, sk, skb);
+			qrtr_node_release(node);
+		}
+	}
 	copied = skb->len;
 	if (copied > size) {
 		copied = size;

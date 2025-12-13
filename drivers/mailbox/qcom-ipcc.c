@@ -12,6 +12,7 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/suspend.h>
+#include <linux/ipc_logging.h>
 
 #include <dt-bindings/mailbox/qcom-ipcc.h>
 
@@ -61,6 +62,11 @@ struct qcom_ipcc {
 	int irq;
 };
 
+#define IPC_LOG_PAGE_CNT        64
+static void *ipcc_ipclog;
+#define IPCC_INFO(ctx, x, ...)         \
+    ipc_log_string(ctx, x, ##__VA_ARGS__)
+
 static inline struct qcom_ipcc *to_qcom_ipcc(struct mbox_controller *mbox)
 {
 	return container_of(mbox, struct qcom_ipcc, mbox);
@@ -84,6 +90,9 @@ static irqreturn_t qcom_ipcc_irq_fn(int irq, void *data)
 			break;
 
 		virq = irq_find_mapping(ipcc->irq_domain, hwirq);
+		IPCC_INFO(ipcc_ipclog, "%s :irq for client_id :%lu; signal_id:%lu; virq: %d",
+			__func__,FIELD_GET(IPCC_CLIENT_ID_MASK, hwirq), FIELD_GET(IPCC_SIGNAL_ID_MASK, hwirq),virq);
+		
 		writel(hwirq, ipcc->base + IPCC_REG_RECV_SIGNAL_CLEAR);
 		generic_handle_irq(virq);
 	}
@@ -369,6 +378,8 @@ static int qcom_ipcc_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, ipcc);
+
+	ipcc_ipclog = ipc_log_context_create(IPC_LOG_PAGE_CNT, "ipcc", 0);
 
 	return 0;
 

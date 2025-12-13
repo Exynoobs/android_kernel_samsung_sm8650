@@ -29,6 +29,7 @@
 #include <linux/nvmem-consumer.h>
 #include <linux/ipc_logging.h>
 #include <linux/pinctrl/qcom-pinctrl.h>
+#include <linux/mmc/slot-gpio.h>
 
 #include <trace/hooks/mmc.h>
 #include "../core/mmc_ops.h"
@@ -46,6 +47,10 @@
 #include "sdhci-msm-scaling.h"
 #endif
 #include "sdhci-msm.h"
+
+#if IS_ENABLED(CONFIG_SEC_MMC_FEATURE)
+#include "mmc-sec-feature.h"
+#endif
 
 #define CORE_MCI_VERSION		0x50
 #define CORE_VERSION_MAJOR_SHIFT	28
@@ -162,7 +167,7 @@
 
 
 #define INVALID_TUNING_PHASE	-1
-#define SDHCI_MSM_MIN_CLOCK	400000
+#define SDHCI_MSM_MIN_CLOCK	300000
 #define CORE_FREQ_100MHZ	(100 * 1000 * 1000)
 #define TCXO_FREQ		19200000
 
@@ -4094,6 +4099,24 @@ static void sdhci_msm_hw_reset(struct sdhci_host *host)
 #endif
 }
 
+#if IS_ENABLED(CONFIG_SEC_MMC_FEATURE)
+static void sdhci_msm_sec_card_event(struct sdhci_host *host)
+{
+	sd_sec_card_event(host->mmc);
+}
+
+void sdhci_msm_sec_request_done(struct sdhci_host *host,
+		struct mmc_request *mrq)
+{
+	struct mmc_host *mmc = host->mmc;
+
+	mmc_sd_sec_check_req_err(mmc, mrq);
+
+	/* call mmc_request_done() to finish processing an MMC request */
+	mmc_request_done(mmc, mrq);
+}
+#endif
+
 static const struct sdhci_ops sdhci_msm_ops = {
 	.reset = sdhci_msm_reset,
 	.set_clock = sdhci_msm_set_clock,
@@ -4109,6 +4132,10 @@ static const struct sdhci_ops sdhci_msm_ops = {
 	.set_power = sdhci_set_power_noreg,
 	.hw_reset = sdhci_msm_hw_reset,
 	.set_timeout = sdhci_msm_set_timeout,
+#if IS_ENABLED(CONFIG_SEC_MMC_FEATURE)
+	.card_event = sdhci_msm_sec_card_event,
+	.request_done = sdhci_msm_sec_request_done,
+#endif
 };
 
 #if IS_ENABLED(CONFIG_MMC_SDHCI_MSM_SCALING)
@@ -4924,6 +4951,7 @@ static void sdhci_msm_set_caps(struct sdhci_msm_host *msm_host)
 {
 	msm_host->mmc->caps |= MMC_CAP_AGGRESSIVE_PM;
 	msm_host->mmc->caps |= MMC_CAP_WAIT_WHILE_BUSY | MMC_CAP_NEED_RSP_BUSY;
+	msm_host->mmc->caps |= MMC_CAP_CD_WAKE;
 }
 
 static int sdhci_msm_prepare_hibernation(struct sdhci_msm_host *msm_host)
@@ -5524,6 +5552,10 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	/* Initialize sysfs entries */
 	sdhci_msm_init_sysfs_gating_qos(dev);
 
+#if IS_ENABLED(CONFIG_SEC_MMC_FEATURE)
+	sd_sec_set_features(host->mmc, pdev);
+#endif
+
 	if (of_property_read_bool(node, "supports-cqe"))
 		ret = sdhci_msm_cqe_add_host(host, pdev);
 	else
@@ -5544,6 +5576,10 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	 * part of sdhci_add_host().
 	 */
 	msm_host->pltfm_init_done = true;
+
+	ret = mmc_gpio_set_cd_wake(host->mmc, true);
+	if (ret)
+		dev_err(&pdev->dev, "mmc_gpio_set_cd_wake failed\n");
 
 	pm_runtime_mark_last_busy(&pdev->dev);
 	pm_runtime_put_autosuspend(&pdev->dev);

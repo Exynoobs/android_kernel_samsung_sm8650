@@ -27,12 +27,17 @@
 #include <linux/slab.h>
 #include <linux/bootmarker_kernel.h>
 
+#include <linux/samsung/debug/sec_debug.h>
+
 #define SE_GENI_TEST_BUS_CTRL	0x44
 #define SE_NUM_FOR_TEST_BUS	5
 
 #define SE_GENI_CFG_REG68		(0x210)
+#define SE_I2C_NOISE_CANCELATION_CTL	(0x234)
+#define SE_I2C_MONITOR_CTL		(0x238)
 #define SE_I2C_TX_TRANS_LEN		(0x26C)
 #define SE_I2C_RX_TRANS_LEN		(0x270)
+#define SE_I2C_DELAY_COUNTER		(0x274)
 #define SE_I2C_SCL_COUNTERS		(0x278)
 
 /* M_CMD OP codes for I2C */
@@ -233,7 +238,6 @@ struct geni_i2c_dev {
 	atomic_t is_xfer_in_progress; /* Used to maintain xfer inprogress status */
 	bool bus_recovery_enable; /* To be enabled by client if needed */
 	bool i2c_test_dev; /* Set this DT flag to enable test bus dump for an SE */
-	bool is_deep_sleep; /* For deep sleep restore the config similar to the probe. */
 	struct geni_i2c_ssr i2c_ssr;
 	struct geni_se_rsc  rsc;
 };
@@ -771,19 +775,19 @@ static int do_pending_cancel(struct geni_i2c_dev *gi2c)
 	geni_ios = geni_read_reg(gi2c->base, SE_GENI_IOS);
 	if ((geni_ios & 0x3) != 0x3) {
 		/* Try to restore IOS with FORCE_DEFAULT */
-		GENI_SE_ERR(gi2c->ipcl, true, gi2c->dev,
+		GENI_SE_ERR(gi2c->ipcl, false, gi2c->dev,
 			    "%s: IOS:0x%x, bad state\n", __func__, geni_ios);
 
 		geni_write_reg(FORCE_DEFAULT,
 			       gi2c->base, GENI_FORCE_DEFAULT_REG);
 		geni_ios = geni_read_reg(gi2c->base, SE_GENI_IOS);
 		if ((geni_ios & 0x3) != 0x3) {
-			GENI_SE_ERR(gi2c->ipcl, true, gi2c->dev,
+			GENI_SE_ERR(gi2c->ipcl, false, gi2c->dev,
 				    "%s: IOS:0x%x, Fix from Slave side\n",
 				    __func__, geni_ios);
 			return -EINVAL;
 		}
-		GENI_SE_ERR(gi2c->ipcl, true, gi2c->dev,
+		GENI_SE_ERR(gi2c->ipcl, false, gi2c->dev,
 			    "%s: IOS:0x%x restored properly\n", __func__, geni_ios);
 	}
 
@@ -2579,7 +2583,7 @@ static int geni_i2c_execute_xfer(struct geni_i2c_dev *gi2c,
 				    "i2c error :%d\n", gi2c->err);
 			mutex_unlock(&gi2c->i2c_ssr.ssr_lock);
 			if (geni_i2c_bus_recovery(gi2c))
-				GENI_SE_ERR(gi2c->ipcl, true, gi2c->dev,
+				GENI_SE_ERR(gi2c->ipcl, false, gi2c->dev,
 					    "%s:Bus Recovery failed\n", __func__);
 			mutex_lock(&gi2c->i2c_ssr.ssr_lock);
 			if (gi2c->i2c_ssr.is_ssr_down) {
@@ -2600,6 +2604,8 @@ geni_i2c_execute_xfer_exit:
 	return ret;
 }
 
+int g_test = 0;
+
 /**
  * geni_i2c_xfer() - Performs non GSI mode data transfer
  * @adap: Master controller handle
@@ -2619,6 +2625,18 @@ static int geni_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
 
 	start_time = geni_capture_start_time(&gi2c->i2c_rsc, gi2c->ipc_log_kpi, __func__,
 					     gi2c->i2c_kpi);
+
+	if (!strcmp(dev_name(gi2c->dev), "880000.i2c")) {
+		for (i = 0; i < num; i++) {
+			if (num > 1 && (!msgs[i].len)) {
+				I2C_LOG_ERR(gi2c->ipcl, false, gi2c->dev,
+					"%s: num_msgs %d, I2C msg[%d] length is NULL\n", __func__, num, i);
+				dev_err(gi2c->dev,
+					"%s: num_msgs %d, I2C msg[%d] length is NULL\n", __func__, num, i);
+				return -EINVAL;
+			}
+		}
+	}
 	gi2c->err = 0;
 	atomic_set(&gi2c->is_xfer_in_progress, 1);
 	mutex_lock(&gi2c->i2c_ssr.ssr_lock);
@@ -2681,6 +2699,33 @@ static int geni_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
 	if (!gi2c->is_shared && ((geni_ios & 0x3) != 0x3)) {//SCL:b'1, SDA:b'0
 		I2C_LOG_ERR(gi2c->ipcl, false, gi2c->dev,
 			    "IO lines in bad state, Power the slave\n");
+
+		/* Debug */
+		if (!strcmp(dev_name(gi2c->dev), "880000.i2c")) {
+			geni_i2c_se_dump_dbg_regs(&gi2c->i2c_rsc, gi2c->base, gi2c->ipcl);
+			if (gi2c->se_mode == GSI_ONLY && gi2c->tx_c) {
+				/*gpi dumps*/
+				gpi_dump_for_geni(gi2c->tx_c);
+				g_test++;
+
+				geni_ios = geni_read_reg(gi2c->base, SE_GENI_IOS);
+				if ((geni_ios & 0x3) != 0x3) {
+					/* Try to restore IOS with FORCE_DEFAULT */
+					GENI_SE_ERR(gi2c->ipcl, true, gi2c->dev,
+						    "%s: IOS:0x%x, try Force default\n", __func__, geni_ios);
+					geni_write_reg(FORCE_DEFAULT, gi2c->base, GENI_FORCE_DEFAULT_REG);
+					geni_ios = geni_read_reg(gi2c->base, SE_GENI_IOS);
+					if ((geni_ios & 0x3) != 0x3) {
+						GENI_SE_ERR(gi2c->ipcl, true, gi2c->dev,
+							    "%s: IOS:0x%x still in bad state\n", __func__, geni_ios);
+					} else {
+						GENI_SE_ERR(gi2c->ipcl, true, gi2c->dev,
+							    "%s: IOS:0x%x in good state\n", __func__, geni_ios);
+						g_test = 0;
+					}
+				}
+			}
+		}
 		/* for levm skip auto suspend timer */
 		if (!gi2c->is_le_vm) {
 			pm_runtime_mark_last_busy(gi2c->dev);
@@ -2993,7 +3038,7 @@ static int geni_i2c_probe(struct platform_device *pdev)
 		gi2c->clk_freq_out = KHz(400);
 	dev_info(&pdev->dev, "Bus frequency is set to %dHz.\n",
 						gi2c->clk_freq_out);
-	gi2c->is_deep_sleep = false;
+	//gi2c->is_deep_sleep = false;
 
 	ret = geni_i2c_clk_map_idx(gi2c);
 	if (ret) {
@@ -3167,10 +3212,11 @@ static int geni_i2c_resume_early(struct device *device)
 	geni_se_ssc_clk_enable(&gi2c->rsc, true);
 	I2C_LOG_DBG(gi2c->ipcl, false, gi2c->dev, "%s ret=%d\n", __func__, true);
 
-	if (!gi2c->is_le_vm && pm_suspend_target_state == PM_SUSPEND_MEM) {
+/*	if (pm_suspend_target_state == PM_SUSPEND_MEM) {
 		gi2c->se_mode = UNINITIALIZED;
 		gi2c->is_deep_sleep = true;
 	}
+*/
 	return 0;
 }
 
@@ -3203,19 +3249,22 @@ static int geni_i2c_gpi_pause_resume(struct geni_i2c_dev *gi2c, bool is_suspend)
 		if (is_suspend) {
 			tx_ret = dmaengine_pause(gi2c->tx_c);
 		} else {
+			
+			tx_ret = dmaengine_resume(gi2c->tx_c);
 			/* For deep sleep need to restore the config similar to the probe,
 			 * hence using MSM_GPI_DEEP_SLEEP_INIT flag, in gpi_resume it will
 			 * do similar to the probe. After this we should set this flag to
 			 * MSM_GPI_DEFAULT, means gpi probe state is restored.
-			 */
+			 
 			if (gi2c->is_deep_sleep)
 				gi2c->tx_ev.cmd = MSM_GPI_DEEP_SLEEP_INIT;
 
-			tx_ret = dmaengine_resume(gi2c->tx_c);
+			
 			if (gi2c->is_deep_sleep) {
 				gi2c->tx_ev.cmd = MSM_GPI_DEFAULT;
 				gi2c->is_deep_sleep = false;
 			}
+			*/
 		}
 
 		if (tx_ret) {
@@ -3313,7 +3362,7 @@ static int geni_i2c_runtime_resume(struct device *dev)
 		char ipc_name[I2C_NAME_SIZE];
 
 		snprintf(ipc_name, I2C_NAME_SIZE, "%s", dev_name(gi2c->dev));
-		gi2c->ipcl = ipc_log_context_create(2, ipc_name, 0);
+		gi2c->ipcl = ipc_log_context_create(12, ipc_name, 0);
 	}
 
 	if (!gi2c->is_le_vm) {
