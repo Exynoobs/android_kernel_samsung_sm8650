@@ -10518,17 +10518,15 @@ int msm_pcie_allow_l1(struct pci_dev *pci_dev)
 		}
 	}
 #endif
+	msm_pcie_config_l1_enable_all(pcie_dev);
+
 	msm_pcie_write_mask(pcie_dev->parf + PCIE20_PARF_PM_CTRL, BIT(5), 0);
-	/* enable L1 */
-	msm_pcie_write_mask(pcie_dev->dm_core +
-				(root_pci_dev->pcie_cap + PCI_EXP_LNKCTL),
-				0, PCI_EXP_LNKCTL_ASPM_L1);
 #ifdef CONFIG_SEC_PCIE_L1SS
 	if (!(val & PCI_EXP_LNKCTL_ASPM_L1))
 		sec_pcie_enable_ep_l1(ep_pci_dev, pcie_dev);
 #endif
-	PCIE_DBG2(pcie_dev, "[%d] PCIe: RC%d: %02x:%02x.%01x: exit\n",
-		current->pid, pcie_dev->rc_idx, pci_dev->bus->number,
+	PCIE_DBG2(pcie_dev, "PCIe: RC%d: %02x:%02x.%01x: exit\n",
+		pcie_dev->rc_idx, pci_dev->bus->number,
 		PCI_SLOT(pci_dev->devfn), PCI_FUNC(pci_dev->devfn));
 out:
 	mutex_unlock(&pcie_dev->aspm_lock);
@@ -10542,6 +10540,7 @@ int msm_pcie_prevent_l1(struct pci_dev *pci_dev)
 {
 	struct pci_dev *root_pci_dev;
 	struct msm_pcie_dev_t *pcie_dev;
+	struct pci_bus *bus;
 	u32 cnt = 0;
 	u32 cnt_max = 1000; /* 100ms timeout */
 	int ret = 0;
@@ -10553,6 +10552,7 @@ int msm_pcie_prevent_l1(struct pci_dev *pci_dev)
 	}
 
 	pcie_dev = PCIE_BUS_PRIV_DATA(root_pci_dev->bus);
+	bus = pcie_dev->dev->bus;
 
 	/* disable L1 */
 	mutex_lock(&pcie_dev->setup_lock);
@@ -10586,9 +10586,6 @@ int msm_pcie_prevent_l1(struct pci_dev *pci_dev)
 	if (pcie_dev->prevent_l1++)
 		goto out;
 
-	msm_pcie_write_mask(pcie_dev->dm_core +
-				(root_pci_dev->pcie_cap + PCI_EXP_LNKCTL),
-				PCI_EXP_LNKCTL_ASPM_L1, 0);
 	msm_pcie_write_mask(pcie_dev->parf + PCIE20_PARF_PM_CTRL, 0, BIT(5));
 
 	/* confirm link is in L0/L0s */
@@ -10623,8 +10620,10 @@ int msm_pcie_prevent_l1(struct pci_dev *pci_dev)
 		usleep_range(100, 105);
 	}
 
-	PCIE_DBG2(pcie_dev, "[%d] PCIe: RC%d: %02x:%02x.%01x: exit\n",
-		current->pid, pcie_dev->rc_idx, pci_dev->bus->number,
+	msm_pcie_config_l1_disable_all(pcie_dev, bus);
+
+	PCIE_DBG2(pcie_dev, "PCIe: RC%d: %02x:%02x.%01x: exit\n",
+		pcie_dev->rc_idx, pci_dev->bus->number,
 		PCI_SLOT(pci_dev->devfn), PCI_FUNC(pci_dev->devfn));
 out:
 	mutex_unlock(&pcie_dev->aspm_lock);
@@ -11681,7 +11680,7 @@ static void msm_pcie_drv_connect_notify_all(struct work_struct *work)
 	struct pcie_drv_sta *pcie_drv = container_of(work, struct pcie_drv_sta,
 						     drv_connect_notify_all);
 	struct msm_pcie_drv_info *drv_info;
-	struct msm_pcie_dev_t *pcie_itr, *pcie_dev;
+	struct msm_pcie_dev_t *pcie_itr, *pcie_dev = NULL;
 	int i;
 
 	/* rpmsg probe hasn't happened yet */
@@ -11717,7 +11716,7 @@ static void msm_pcie_drv_connect_notify_all(struct work_struct *work)
 		mutex_unlock(&pcie_itr->drv_pc_lock);
 	}
 
-	if (!pcie_drv->notifier) {
+	if (!pcie_drv->notifier && pcie_dev) {
 		pcie_drv->notifier = qcom_register_early_ssr_notifier(pcie_dev->drv_name,
 						&pcie_drv->nb);
 		if (IS_ERR(pcie_drv->notifier)) {
