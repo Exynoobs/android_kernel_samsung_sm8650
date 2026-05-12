@@ -229,7 +229,6 @@ source "drivers/iommu/intel/Kconfig"
 config IRQ_REMAP
 	bool "Support for Interrupt Remapping"
 	depends on X86_64 && X86_IO_APIC && PCI_MSI && ACPI
-	select DMAR_TABLE if INTEL_IOMMU
 	help
 	  Supports Interrupt remapping for IO-APIC and MSI devices.
 	  To use x2apic mode in the CPU's which support x2APIC enhancements or
@@ -675,5 +674,15 @@ config QCOM_IOMMU_DEBUG
 	  the IOMMU framework code. IOMMU profiling and debugging
 	  can be done through the debugfs nodes which this option
 	  makes available.
+
+config QCOM_SMMU_IRGN0_ERRATA
+	bool "IRGN0 errata"
+	depends on QCOM_IOMMU_UTIL
+	depends on ARCH_SERAPH
+        help
+	  This option is used to apply a work around for
+	  an internal errata to adjust the irgn bit.
+
+	  Say N here if unsure.
 
 endif # IOMMU_SUPPORT

@@ -767,7 +767,7 @@ static int __qcom_smd_send(struct qcom_smd_channel *channel, const void *data,
 	__le32 hdr[5] = { cpu_to_le32(len), };
 	int tlen = sizeof(hdr) + len;
 	unsigned long flags;
-	int ret;
+	int ret = 0;
 
 	/* Word aligned channels only accept word size aligned data */
 	if (channel->info_word && len % 4)
@@ -1481,8 +1481,8 @@ static int qcom_smd_parse_edge(struct device *dev,
 	}
 
 	ret = devm_request_irq(dev, irq,
-			       qcom_smd_edge_intr, IRQF_TRIGGER_RISING,
-			       node->name, edge);
+				qcom_smd_edge_intr, IRQF_TRIGGER_RISING
+				| IRQF_NO_SUSPEND, node->name, edge);
 	if (ret) {
 		dev_err(dev, "failed to request smd irq\n");
 		goto put_node;
