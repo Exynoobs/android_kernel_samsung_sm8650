@@ -3946,5 +3946,7 @@ static inline unsigned long get_low_threshold(void)
 }
 
 #define GPU_PAGE_MAGIC (0x9A0E06B9A0E)
+void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
+							unsigned int alloc_flags);
 
 #endif /* _LINUX_MM_H */
